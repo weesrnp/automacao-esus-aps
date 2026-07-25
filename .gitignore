@@ -1,0 +1,12 @@
+.venv/
+venv/
+.env
+PARAR.txt
+log_exportacao.txt
+historico_exportacoes.json
+exports/
+*.zip
+*.xml
+*.thmx
+*.png
+__pycache__/

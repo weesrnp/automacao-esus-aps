@@ -286,6 +286,108 @@ def preencher_datas(frame, data_hoje):
         log(f"  ! Erro ao preencher datas: {e}")
         return False
 
+def verificar_notificacao_sem_producao(page):
+    """
+    R1: Detecta instantaneamente toasts/popups indicando 'sem produção' ou 'não foram encontrados registros'.
+    Escaneia page.frames em busca de containers de notificação e modal.
+    Retorna (True, texto_encontrado) se detectado, caso contrário (False, "").
+    """
+    padroes = [
+        "não foram encontrados registros", "nao foram encontrados registros",
+        "não há registros", "nao ha registros",
+        "sem produção", "sem producao",
+        "nenhum registro",
+        "não existem registros", "nao existem registros",
+        "não existem dados", "nao existem dados",
+        "não há dados para exportar", "nao ha dados para exportar",
+        "sem dados para o período", "sem dados para o periodo",
+        "registros não encontrados", "registros nao encontrados"
+    ]
+
+    for frame in page.frames:
+        try:
+            res = frame.evaluate("""
+                (padroes) => {
+                    const selectors = [
+                        '#system_aviso', '#system_aviso_texto', '#system_aviso_conteudo',
+                        '#system_aviso_mensagem', '.ui-dialog', '.ui-dialog-content',
+                        '#sobreposta-confirmacao-padrao', '#sobreposta-aviso',
+                        '[id*="sobreposta"]', '.toast', '.toast-message', '.alert',
+                        '.alert-warning', '.alert-danger', '.alert-info',
+                        '#mensagem_sistema', '.pnotify', '.div-notificacao',
+                        '.modal-body', '.modal-content', 'div[role="alert"]'
+                    ];
+                    
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                                const text = (el.innerText || el.textContent || '').toLowerCase();
+                                for (const p of padroes) {
+                                    if (text.includes(p)) {
+                                        return { encontrado: true, texto: (el.innerText || el.textContent || '').trim() };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    const backdrop = document.querySelector('.modal-backdrop, .ui-widget-overlay');
+                    if (backdrop && backdrop.offsetWidth > 0) {
+                        const bodyText = (document.body.innerText || document.body.textContent || '').toLowerCase();
+                        for (const p of padroes) {
+                            if (bodyText.includes(p)) {
+                                return { encontrado: true, texto: 'Detectado em modal ativo' };
+                            }
+                        }
+                    }
+                    
+                    return { encontrado: false, texto: '' };
+                }
+            """, padroes)
+
+            if res and res.get("encontrado"):
+                return True, res.get("texto", "")
+        except Exception:
+            pass
+
+    return False, ""
+
+def fechar_notificacao_se_existir(page):
+    """
+    R2: Dismiss modal/toast clicando em botões de fechar ou OK.
+    """
+    for frame in page.frames:
+        try:
+            frame.evaluate("""
+                () => {
+                    const selectors = [
+                        '#system_aviso_confirma', '#system_aviso_fechar',
+                        '.toast-close-button', '.ui-dialog-titlebar-close',
+                        '#system_aviso_btn_ok', '.btn-primary', '[id*="fechar"]',
+                        '[id*="confirmar"]'
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                            try { el.click(); } catch(e) {}
+                        }
+                    }
+                    const buttons = document.querySelectorAll('button, input[type="button"], input[type="submit"], a.btn');
+                    for (const btn of buttons) {
+                        if (btn && btn.offsetWidth > 0 && btn.offsetHeight > 0) {
+                            const txt = (btn.innerText || btn.value || '').trim().toLowerCase();
+                            if (txt === 'ok' || txt === 'fechar' || txt.includes('fechar') || txt === 'confirmar') {
+                                try { btn.click(); } catch(e) {}
+                            }
+                        }
+                    }
+                }
+            """)
+        except Exception:
+            pass
+    clicar_em_frames(page, seletor="#system_aviso_confirma", timeout_sec=1)
+
 def executar_automacao_lote():
     from playwright.sync_api import sync_playwright
 
@@ -355,6 +457,7 @@ def executar_automacao_lote():
         total_ok = 0
         total_falha = 0
         total_puladas = 0
+        total_sem_producao = 0
 
         for i, ficha in enumerate(FICHAS_EXPORTAR, 1):
             if verificar_parada():
@@ -434,10 +537,18 @@ def executar_automacao_lote():
 
             clicar_em_frames(page, seletor="#sobreposta-confirmacao-padrao-confirmar", timeout_sec=4)
 
+            # J) Aguardar processamento com detecção instantânea de Sem Produção (R1/R2)
             log(" -> Aguardando processamento...")
             processamento_ok = False
-            for _ in range(30):
-                time.sleep(2)
+            sem_producao_detectado = False
+
+            start_wait = time.time()
+            while time.time() - start_wait < 30:
+                det_sem_prod, msg_det = verificar_notificacao_sem_producao(page)
+                if det_sem_prod:
+                    sem_producao_detectado = True
+                    break
+
                 for frame in page.frames:
                     try:
                         for sel in ["[title*='Incluir']", "[id*='incluir']", "input[value='Incluir']",
@@ -453,17 +564,29 @@ def executar_automacao_lote():
                 if processamento_ok:
                     break
 
+                time.sleep(0.5)
+
+            if sem_producao_detectado:
+                log(f"  [SEM PRODUÇÃO] Ficha '{ficha}': Não foram encontrados registros para o período.")
+                total_sem_producao += 1
+                fechar_notificacao_se_existir(page)
+                clicar_em_frames(page, texto="Voltar", timeout_sec=3)
+                time.sleep(1)
+                continue
+
             if not processamento_ok:
                 log(" -> Tempo de processamento excedido, continuando...")
-
-            total_ok += 1
-            log(f" [OK] {ficha} exportada com sucesso!\n")
+                total_falha += 1
+            else:
+                total_ok += 1
+                log(f" [OK] {ficha} exportada com sucesso!\n")
 
         hora_fim = datetime.now().strftime("%H:%M")
         log("\n" + "=" * 70)
         log("  PROCESSO EM LOTE CONCLUIDO!")
         log(f"  Data: {data_hoje} ({hora_inicio} as {hora_fim})")
         log(f"  Exportadas com Sucesso: {total_ok}")
+        log(f"  Sem Produção:           {total_sem_producao}")
         log(f"  Puladas (duplicata):    {total_puladas}")
         log(f"  Falhas:                 {total_falha}")
         log("=" * 70)
@@ -472,6 +595,7 @@ def executar_automacao_lote():
             f"🏥 *Relatório de Exportação e-SUS APS*\n\n"
             f"📅 *Data:* {data_hoje} ({hora_inicio} às {hora_fim})\n"
             f"✅ *Sucesso:* {total_ok} fichas\n"
+            f"⚠️ *Sem Produção:* {total_sem_producao} fichas\n"
             f"⏩ *Puladas (duplicatas):* {total_puladas} fichas\n"
             f"❌ *Falhas:* {total_falha} fichas\n\n"
             f"📁 *Pasta:* `{PASTA_HOJE.name}`"
